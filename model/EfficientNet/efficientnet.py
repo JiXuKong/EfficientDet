@@ -1,12 +1,10 @@
 '''
-codes from: https://github.com/qubvel/efficientnet
+codes referenced from: https://github.com/qubvel/efficientnet
 '''
-
-
 
 import numpy as np
 import tensorflow as tf
-import tensorflow.keras.layers as layers
+import tensorflow.layers as layers
 import collections
 
 BlockArgs = collections.namedtuple('BlockArgs', [
@@ -33,6 +31,11 @@ DEFAULT_BLOCKS_ARGS = [
               expand_ratio=6, id_skip=True, strides=[1, 1], se_ratio=0.25)
 ]
 
+
+
+
+
+
 def round_filters(filters, width_coefficient, depth_divisor):
     """Round number of filters based on width multiplier."""
     filters *= width_coefficient
@@ -47,7 +50,7 @@ def round_repeats(repeats, depth_coefficient):
     """Round number of repeats based on depth multiplier."""
     return int(math.ceil(depth_coefficient * repeats))
 
-def conv_kernel_initializer(shape, dtype):
+def conv_kernel_initializer(shape, dtype=None):
     kernel_height, kernel_width, _, out_filters = shape
     fan_out = int(kernel_height * kernel_width * out_filters)
     return tf.random_normal(
@@ -76,7 +79,7 @@ def drop_connect(inputs, is_training, drop_connect_rate):
         
 
 
-def MBConvBlock(inputs, block_args, is_training, drop_rate=None, prefix='', ):
+def MBConvBlock(inputs, block_args, is_training, freeze_bn=True, drop_rate=None, prefix='', ):
     has_se = (block_args.se_ratio is not None) and (0 < block_args.se_ratio <= 1)
     filters = block_args.input_filters * block_args.expand_ratio
     if block_args.expand_ratio != 1:
@@ -86,20 +89,21 @@ def MBConvBlock(inputs, block_args, is_training, drop_rate=None, prefix='', ):
                           trainable = is_training,
                           kernel_initializer=conv_kernel_initializer,
                           name=prefix + 'expand_conv')
-        x = layers.BatchNormalization(x, trainable=is_training, name=prefix + 'expand_bn')
+        x = layers.BatchNormalization(x, trainable=freeze_bn, name=prefix + 'expand_bn')
         x = tf.nn.swish(x)
     else:
         x = inputs
     
      # Depthwise Convolution
-    x = layers.DepthwiseConv2D(x, block_args.kernel_size,
+    x = layers.separable_conv2d(x, tf.shape(x)[-1],
+                               block_args.kernel_size,
                                strides=block_args.strides,
                                padding='same',
                                use_bias=False,
                                trainable = is_training,
                                depthwise_initializer=conv_kernel_initializer,
                                name=prefix + 'dwconv')
-    x = layers.BatchNormalization(x, trainable=is_training, name=prefix + 'expand_bn')
+    x = layers.BatchNormalization(x, trainable=freeze_bn, name=prefix + 'expand_bn')
     x = tf.nn.swish(x)
     
     # Squeeze and Excitation phase
@@ -107,32 +111,32 @@ def MBConvBlock(inputs, block_args, is_training, drop_rate=None, prefix='', ):
         num_reduced_filters = max(1, int(
             block_args.input_filters * block_args.se_ratio
         ))
-        se_tensor = layers.GlobalAveragePooling2D(x, name=prefix + 'se_squeeze')
+        se_tensor = layers.AveragePooling2D(x, tf.shape(x)[1:3], 1, name=prefix + 'se_squeeze')
 
-        target_shape = (1, 1, filters)#layers.Reshape不包括batch维度
-        se_tensor = layers.Reshape(se_tensor, target_shape, name=prefix + 'se_reshape')#输出[batch, 1, 1, filters]
-        se_tensor = layers.Conv2D(se_tensor, num_reduced_filters, 1,
+        target_shape = [-1, 1, 1, filters]#layers.Reshape不包括batch维度
+        se_tensor = tf.reshape(se_tensor, target_shape, name=prefix + 'se_reshape')#输出[batch, 1, 1, filters]
+        se_tensor = layers.conv2d(se_tensor, num_reduced_filters, 1,
                                   activation=activation,
                                   padding='same',
                                   use_bias=True,
                                   trainable = is_training,
                                   kernel_initializer=conv_kernel_initializer,
                                   name=prefix + 'se_reduce')
-        se_tensor = layers.Conv2D(se_tensor, filters, 1,
+        se_tensor = layers.conv2d(se_tensor, filters, 1,
                                   activation='sigmoid',
                                   padding='same',
                                   use_bias=True,
                                   trainable = is_training,
                                   kernel_initializer=conv_kernel_initializer,
                                   name=prefix + 'se_expand')
-        x = layers.multiply([x, se_tensor], name=prefix + 'se_excite')
-    x = layers.Conv2D(block_args.output_filters, 1,
+        x = tf.multiply(x, se_tensor, name=prefix + 'se_excite')
+    x = layers.conv2d(block_args.output_filters, 1,
                       padding='same',
                       use_bias=False,
                       trainable = is_training,
                       kernel_initializer=conv_kernel_initializer,
                       name=prefix + 'project_conv')
-    x = layers.BatchNormalization(x, trainable=is_training, name=prefix + 'project_bn') 
+    x = layers.BatchNormalization(x, trainable=freeze_bn, name=prefix + 'project_bn') 
     
     if block_args.id_skip and all(
             s == 1 for s in block_args.strides
@@ -150,24 +154,21 @@ def EfficientNet(width_coefficient,
                  depth_divisor=8,
                  blocks_args=DEFAULT_BLOCKS_ARGS,
                  model_name='efficientnet',
-                 include_top=True,
-                 weights='imagenet',
                  input_tensor=None,
-                 input_shape=None,
                  is_training=True,
-                 classes=1000,
+                 freeze_bn=True, 
                  **kwargs):
     features = []
     # Build stem
     x = input_tensor
-    x = layers.Conv2D(x, round_filters(32, width_coefficient, depth_divisor), 3,
+    x = layers.conv2d(x, round_filters(32, width_coefficient, depth_divisor), 3,
                       strides=(2, 2),
                       padding='same',
                       use_bias=False,
                       trainable = is_training,
                       kernel_initializer=conv_kernel_initializer,
                       name='stem_conv')
-    x = layers.layers.BatchNormalization(x, trainable=is_training, name='stem_bn') 
+    x = layers.BatchNormalization(x, trainable=freeze_bn, name='stem_bn') 
     x = tf.nn.swish(x)
     
     # Build blocks
@@ -188,6 +189,7 @@ def EfficientNet(width_coefficient,
         drop_rate = drop_connect_rate * float(block_num) / num_blocks_total
         x = mb_conv_block(x, block_args,
                           is_training=is_training,
+                          freeze_bn = freeze_bn, 
                           drop_rate=drop_rate,
                           prefix='block{}a_'.format(idx + 1))
         block_num += 1
@@ -204,6 +206,7 @@ def EfficientNet(width_coefficient,
                 )
                 x = mb_conv_block(x, block_args,
                                   is_training=is_training,
+                                  freeze_bn = freeze_bn, 
                                   drop_rate=drop_rate,
                                   prefix=block_prefix)
                 block_num += 1
@@ -216,5 +219,96 @@ def EfficientNet(width_coefficient,
 
     
 
+def EfficientNetB0(input_tensor=None,
+                   is_training=True,
+                   freeze_bn=True,
+                   **kwargs):
+    return EfficientNet(1.0, 1.0, 224, 0.2,
+                        model_name='efficientnet-b0',
+                        input_tensor=input_tensor,
+                        is_training=True,
+                        freeze_bn=True,
+                        **kwargs)
 
 
+def EfficientNetB1(input_tensor=None,
+                   is_training=True,
+                   freeze_bn=True,
+                   **kwargs):
+    return EfficientNet(1.0, 1.1, 240, 0.2,
+                        model_name='efficientnet-b1',
+                        input_tensor=input_tensor,
+                        is_training=True,
+                        freeze_bn=True,
+                        **kwargs)
+
+
+def EfficientNetB2(input_tensor=None,
+                   **kwargs):
+    return EfficientNet(1.1, 1.2, 260, 0.3,
+                        model_name='efficientnet-b2',
+                        input_tensor=input_tensor, 
+                        is_training=True,
+                        freeze_bn=True,
+                        **kwargs)
+
+
+def EfficientNetB3(input_tensor=None,
+                   is_training=True,
+                   freeze_bn=True,
+                   **kwargs):
+    return EfficientNet(1.2, 1.4, 300, 0.3,
+                        model_name='efficientnet-b3',
+                        input_tensor=input_tensor,
+                        is_training=True,
+                        freeze_bn=True,
+                        **kwargs)
+
+
+def EfficientNetB4(input_tensor=None,
+                   is_training=True,
+                   freeze_bn=True,
+                   **kwargs):
+    return EfficientNet(1.4, 1.8, 380, 0.4,
+                        model_name='efficientnet-b4',
+                        input_tensor=input_tensor, 
+                        is_training=True,
+                        freeze_bn=True,
+                        **kwargs)
+
+
+def EfficientNetB5(input_tensor=None,
+                   is_training=True,
+                   freeze_bn=True,
+                   **kwargs):
+    return EfficientNet(1.6, 2.2, 456, 0.4,
+                        model_name='efficientnet-b5',
+                        input_tensor=input_tensor,
+                        is_training=True,
+                        freeze_bn=True,
+                        **kwargs)
+
+
+def EfficientNetB6(input_tensor=None,
+                   is_training=True,
+                   freeze_bn=True,
+                   **kwargs):
+    return EfficientNet(1.8, 2.6, 528, 0.5,
+                        model_name='efficientnet-b6',
+                        input_tensor=input_tensor,
+                        **kwargs)
+
+
+def EfficientNetB7(input_tensor=None,
+                   is_training=True,
+                   freeze_bn=True,
+                   **kwargs):
+    return EfficientNet(2.0, 3.1, 600, 0.5,
+                        model_name='efficientnet-b7',
+                        input_tensor=input_tensor,
+                        is_training=True,
+                        freeze_bn=True,
+                        **kwargs)
+
+backbones = [EfficientNetB0, EfficientNetB1, EfficientNetB2,
+             EfficientNetB3, EfficientNetB4, EfficientNetB5, EfficientNetB6]
